@@ -175,6 +175,32 @@ data class Trade(
         return plan.direction.sign * cash - fills.sumOf { it.fee } + signedFunding
     }
 
+    internal fun validateStoredRecord() {
+        // Stored estimates are historical facts. Validate their invariants without re-running today's calculator.
+        check(plan.entry > ZERO && plan.stop > ZERO && plan.direction.sign * (plan.entry - plan.stop) > ZERO &&
+            plan.target > ZERO && plan.minimumTarget > ZERO && plan.quantity > ZERO &&
+            plan.budget > ZERO && plan.risk > ZERO && plan.risk <= plan.budget &&
+            plan.reward >= TWO * plan.risk && plan.margin > ZERO &&
+            plan.entryFee >= ZERO && plan.stopFee >= ZERO && plan.targetFee >= ZERO) {
+            "Invalid stored plan for trade #$id."
+        }
+        var remaining = ZERO
+        var previous: Instant? = null
+        for (fill in fills) {
+            check(previous?.let { fill.time >= it } != false) { "Fills for trade #$id are out of order." }
+            remaining += if (fill.kind == FillKind.Entry) fill.quantity else -fill.quantity
+            check(remaining >= ZERO) { "An exit for trade #$id exceeds the open quantity." }
+            previous = fill.time
+        }
+        if (status == Status.Closed) {
+            check(funding != null && closed == fills.lastOrNull()?.time &&
+                pnl?.compareTo(netPnl(funding)) == 0) { "Invalid closed trade #$id." }
+        } else {
+            check(closed == null && pnl == null && funding == null &&
+                (fills.isNotEmpty() == (status == Status.Open))) { "Invalid active or cancelled trade #$id." }
+        }
+    }
+
     fun deviations(): List<String> = buildList {
         if (fills.any { it.kind == FillKind.Entry && it.price.compareTo(plan.entry) != 0 })
             add("An entry fill differed from the planned entry price.")

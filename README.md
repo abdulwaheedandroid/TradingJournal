@@ -1,6 +1,6 @@
 # Trading Journal
 
-Offline Windows desktop journal for Bitget BTCUSDT USDT-M futures on the five-minute timeframe. Built with Kotlin/JVM, Compose Multiplatform Material 3, and SQLite JDBC. The app records manual plans and fills.
+Offline Windows desktop journal for Bitget BTCUSDT USDT-M futures on the five-minute timeframe. Built with Kotlin/JVM, Compose Multiplatform Material 3, and Room with the bundled SQLite driver. The app records manual plans and fills.
 
 ## Run and package on Windows
 
@@ -24,7 +24,7 @@ The MSI is written under `build/compose/binaries/main/msi/`. Use `.\gradlew.bat 
 
 ## Database and export
 
-On Windows the database is `%LOCALAPPDATA%\TradingJournal\journal-v2.sqlite3`. This filename keeps the Kotlin database separate from the prototype's `journal.sqlite3`. The Kotlin restore command accepts backups created by this version. A separate test data directory can be selected with the JVM system property `tradingjournal.dataDir`.
+On Windows the database is `%LOCALAPPDATA%\TradingJournal\journal-v2.sqlite3`. Room upgrades the previous Kotlin app's database from schema version 2 to 3 in place on first launch. Restore accepts backups from both Kotlin versions. The Python prototype uses a separate file named `journal.sqlite3`. A separate test data directory can be selected with the JVM system property `tradingjournal.dataDir`.
 
 Use **Settings** to back up the database or restore a validated backup. Restore replaces the current journal after confirmation. Use **Trade History** to export the full trade history and fills to CSV.
 

@@ -18,6 +18,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.withContext
 import java.awt.Dimension
 import java.io.File
 import java.math.BigDecimal
@@ -34,13 +37,15 @@ private val zone = ZoneId.systemDefault()
 private val dateTime = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(zone)
 
 fun main() = application {
-    val opened = remember {
-        runCatching {
-            val directory = System.getenv("LOCALAPPDATA")?.let(Path::of)
-                ?: Path.of(System.getProperty("user.home"), ".local", "share")
-            val override = System.getProperty("tradingjournal.dataDir")
-            val data = override?.let(Path::of) ?: directory.resolve("TradingJournal")
-            Journal(data.resolve("journal-v2.sqlite3"))
+    val opened by produceState<Result<Journal>?>(null) {
+        var journal: Journal? = null
+        try {
+            value = withContext(journalIo) {
+                runCatching { Journal(journalPath()).also { journal = it } }
+            }
+            awaitCancellation()
+        } finally {
+            withContext(journalIo + NonCancellable) { journal?.close() }
         }
     }
     Window(onCloseRequest = ::exitApplication, title = "Trading Journal",
@@ -57,67 +62,47 @@ fun main() = application {
             onSurface = Color(0xFF172A24)
         )) {
             Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                val journal = opened.getOrNull()
-                if (journal != null) {
-                    JournalApp(journal)
-                } else {
+                val result = opened
+                val journal = result?.getOrNull()
+                if (result == null) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("Opening journal…")
+                    }
+                } else if (journal == null) {
                     Column(Modifier.padding(32.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Heading("The journal could not be opened")
-                        Text(opened.exceptionOrNull()?.message ?: "Unknown database error")
+                        Text(result.exceptionOrNull()?.message ?: "Unknown database error")
                         Button(onClick = ::exitApplication) { Text("Exit") }
                     }
+                } else {
+                    JournalApp(journal)
                 }
             }
         }
     }
 }
 
-private enum class Screen(val label: String) {
-    Dashboard("Dashboard"), Calculator("Trade Calculator"), History("Trade History"), Settings("Settings")
+private fun journalPath(): Path {
+    val directory = System.getenv("LOCALAPPDATA")?.let(Path::of)
+        ?: Path.of(System.getProperty("user.home"), ".local", "share")
+    val data = System.getProperty("tradingjournal.dataDir")?.let(Path::of) ?: directory.resolve("TradingJournal")
+    return data.resolve("journal-v2.sqlite3")
 }
 
-private class UiState(private val journal: Journal) {
-    var settings by mutableStateOf<Settings?>(null)
-        private set
-    var trades by mutableStateOf(emptyList<Trade>())
-        private set
-    var equity by mutableStateOf(emptyList<EquityPoint>())
-        private set
-    var screen by mutableStateOf(Screen.Dashboard)
-    var selected by mutableStateOf<Long?>(null)
-    var feedback by mutableStateOf<String?>(null)
-    var error by mutableStateOf<String?>(null)
-    var backupToRestore by mutableStateOf<Path?>(null)
-    var restoreCount by mutableIntStateOf(0)
-
-    init {
-        action { refresh() }
-        if (settings == null) screen = Screen.Settings
-    }
-
-    fun refresh() {
-        val nextSettings = journal.settings()
-        val nextTrades = journal.trades()
-        val nextEquity = journal.equity()
-        settings = nextSettings
-        trades = nextTrades
-        equity = nextEquity
-    }
-
-    fun action(message: String? = null, operation: () -> Unit) {
-        feedback = null
-        try {
-            operation()
-            if (message != null) feedback = message
-        } catch (failure: Exception) {
-            error = failure.message ?: "The operation failed."
-        }
-    }
+internal enum class Screen(val label: String) {
+    Dashboard("Dashboard"), Calculator("Trade Calculator"), History("Trade History"), Settings("Settings")
 }
 
 @Composable
 private fun JournalApp(journal: Journal) {
-    val ui = remember(journal) { UiState(journal) }
+    val scope = rememberCoroutineScope()
+    val ui = remember(journal, scope) { UiState(journal, scope) }
+    LaunchedEffect(ui) {
+        ui.action {
+            ui.refresh()
+            if (ui.settings == null) ui.screen = Screen.Settings
+        }
+    }
     Column(Modifier.fillMaxSize()) {
         Surface(color = MaterialTheme.colorScheme.surface) {
             Column(Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 20.dp)) {
@@ -148,6 +133,14 @@ private fun JournalApp(journal: Journal) {
         }
     }
 
+    if (ui.busy) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Working…") },
+            text = { LinearProgressIndicator(Modifier.fillMaxWidth()) },
+            confirmButton = {}
+        )
+    }
     ui.error?.let { error ->
         AlertDialog(onDismissRequest = { ui.error = null }, title = { Text("Check this operation") },
             text = { Text(error) }, confirmButton = {
@@ -162,7 +155,7 @@ private fun JournalApp(journal: Journal) {
                 Button(onClick = {
                     ui.backupToRestore = null
                     ui.action("Backup restored.") {
-                        journal.restore(source)
+                        withContext(journalIo) { journal.restore(source) }
                         ui.selected = null
                         ui.refresh()
                         ui.restoreCount++
@@ -227,7 +220,9 @@ private fun Dashboard(journal: Journal, ui: UiState) {
                 Field("Local time YYYY-MM-DD HH:MM (optional)", timestamp, { timestamp = it }, Modifier.weight(1f))
                 Button(onClick = {
                     ui.action("Transfer recorded.") {
-                        journal.transfer(decimal(transfer, "transfer amount"), parseTimestamp(timestamp))
+                        val amount = decimal(transfer, "transfer amount")
+                        val time = parseTimestamp(timestamp)
+                        withContext(journalIo) { journal.transfer(amount, time) }
                         transfer = ""
                         timestamp = ""
                         ui.refresh()
@@ -301,8 +296,14 @@ private fun Calculator(journal: Journal, ui: UiState) {
                                 decimal(stop, "stop price"), targetPrice())
                         } }) { Text("Calculate") }
                         Button(onClick = { ui.action("Trade plan saved.") {
-                            val id = journal.savePlan(direction, decimal(entry, "entry price"),
-                                decimal(stop, "stop price"), targetPrice(), notes)
+                            val side = direction
+                            val entryPrice = decimal(entry, "entry price")
+                            val stopPrice = decimal(stop, "stop price")
+                            val targetPrice = targetPrice()
+                            val planNotes = notes
+                            val id = withContext(journalIo) {
+                                journal.savePlan(side, entryPrice, stopPrice, targetPrice, planNotes)
+                            }
                             ui.refresh()
                             ui.selected = id
                             ui.screen = Screen.History
@@ -370,7 +371,7 @@ private fun History(journal: Journal, ui: UiState) {
             Heading("Trade History")
             OutlinedButton(onClick = { ui.action {
                 chooseFile("Export trade history", "Trade-History.csv")?.let {
-                    journal.export(it)
+                    withContext(journalIo) { journal.export(it) }
                     ui.feedback = "Trade history exported."
                 }
             } }) { Text("Export CSV") }
@@ -466,8 +467,9 @@ private fun Detail(journal: Journal, ui: UiState, trade: Trade) {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Field("Local time YYYY-MM-DD HH:MM (optional)", time, { time = it }, Modifier.weight(1f))
                 Button(onClick = { ui.action("Fill recorded.") {
-                    journal.addFill(trade.id, Fill(parseTimestamp(time), kind, decimal(price, "fill price"),
-                        decimal(quantity, "fill quantity"), decimal(fee, "fill fee")))
+                    val fill = Fill(parseTimestamp(time), kind, decimal(price, "fill price"),
+                        decimal(quantity, "fill quantity"), decimal(fee, "fill fee"))
+                    withContext(journalIo) { journal.addFill(trade.id, fill) }
                     price = ""
                     quantity = ""
                     fee = "0"
@@ -482,7 +484,8 @@ private fun Detail(journal: Journal, ui: UiState, trade: Trade) {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Field("Signed funding USDT (+ received, − paid)", funding, { funding = it }, Modifier.weight(1f))
                 Button(enabled = trade.open.signum() == 0, onClick = { ui.action("Trade closed.") {
-                    journal.closeTrade(trade.id, decimal(funding, "signed funding"))
+                    val signedFunding = decimal(funding, "signed funding")
+                    withContext(journalIo) { journal.closeTrade(trade.id, signedFunding) }
                     ui.refresh()
                 } }) { Text("Close trade") }
             }
@@ -490,7 +493,8 @@ private fun Detail(journal: Journal, ui: UiState, trade: Trade) {
         Field("Notes", notes, { notes = it }, multiline = true)
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             OutlinedButton(onClick = { ui.action("Notes saved.") {
-                journal.saveNotes(trade.id, notes)
+                val savedNotes = notes
+                withContext(journalIo) { journal.saveNotes(trade.id, savedNotes) }
                 ui.refresh()
             } }) { Text("Save notes") }
             if (trade.status == Status.Planned) TextButton(onClick = { cancel = true }) { Text("Cancel plan") }
@@ -500,7 +504,10 @@ private fun Detail(journal: Journal, ui: UiState, trade: Trade) {
         text = { Text("The plan will stay in history with Cancelled status.") },
         confirmButton = { Button(onClick = {
             cancel = false
-            ui.action("Plan cancelled.") { journal.cancel(trade.id); ui.refresh() }
+            ui.action("Plan cancelled.") {
+                withContext(journalIo) { journal.cancel(trade.id) }
+                ui.refresh()
+            }
         }) { Text("Cancel plan") } },
         dismissButton = { TextButton(onClick = { cancel = false }) { Text("Keep plan") } })
 }
@@ -525,7 +532,8 @@ private fun SettingsScreen(journal: Journal, ui: UiState) {
             }
         }
         Button(onClick = { ui.action("Settings saved.") {
-            journal.saveSettings(Settings.parse(fields))
+            val settings = Settings.parse(fields)
+            withContext(journalIo) { journal.saveSettings(settings) }
             ui.refresh()
         } }) { Text("Save settings") }
         HorizontalDivider()
@@ -533,13 +541,13 @@ private fun SettingsScreen(journal: Journal, ui: UiState) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             OutlinedButton(onClick = { ui.action {
                 chooseFile("Save database backup", "TradingJournal-Backup.sqlite3")?.let {
-                    journal.backup(it)
+                    withContext(journalIo) { journal.backup(it) }
                     ui.feedback = "Database backup saved."
                 }
             } }) { Text("Back up database") }
             OutlinedButton(onClick = { ui.action {
                 chooseFile("Choose database backup")?.let {
-                    journal.validateBackup(it)
+                    withContext(journalIo) { journal.validateBackup(it) }
                     ui.backupToRestore = it
                 }
             } }) { Text("Restore backup") }
