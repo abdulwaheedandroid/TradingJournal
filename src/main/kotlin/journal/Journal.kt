@@ -1,93 +1,70 @@
 package journal
 
-import org.sqlite.SQLiteConfig
+import androidx.room.Room
+import androidx.room.Transactor
+import androidx.room.deferredTransaction
+import androidx.room.immediateTransaction
+import androidx.room.useReaderConnection
+import androidx.room.useWriterConnection
+import androidx.sqlite.SQLiteDriver
+import androidx.sqlite.SQLiteStatement
+import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import androidx.sqlite.driver.bundled.SQLITE_OPEN_CREATE
+import androidx.sqlite.driver.bundled.SQLITE_OPEN_READWRITE
+import androidx.sqlite.driver.bundled.SQLITE_OPEN_URI
+import kotlinx.coroutines.runBlocking
 import java.math.BigDecimal
 import java.nio.file.Files
 import java.nio.file.Path
-import java.sql.Connection
-import java.sql.DriverManager
-import java.sql.ResultSet
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.time.Clock
 import java.time.Instant
 
-class Journal(private val path: Path, private val clock: Clock = Clock.systemUTC()) {
-    private val tables = linkedMapOf(
-        "settings" to "id,data",
-        "trades" to "id,created,status,direction,entry,stop,target,minimum_target,quantity,budget,risk,reward,margin,entry_fee,stop_fee,target_fee,assumptions,notes,closed,pnl,funding",
-        "fills" to "id,trade_id,time,kind,price,quantity,fee",
-        "transfers" to "id,time,amount"
-    )
+internal data class JournalSnapshot(
+    val settings: Settings?,
+    val trades: List<Trade>,
+    val equity: List<EquityPoint>
+)
+
+class Journal(private val path: Path, private val clock: Clock = Clock.systemUTC()) : AutoCloseable {
+    private val database: JournalDatabase
 
     init {
         Files.createDirectories(path.toAbsolutePath().parent)
-        write { db ->
-            when (db.version()) {
-                0 -> {
-                    require(db.query("SELECT name FROM sqlite_master WHERE type='table'") { getString(1) }.isEmpty()) {
-                        "The existing database is not an empty Trading Journal database."
-                    }
-                    db.exec("CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)")
-                    db.exec("""
-                        CREATE TABLE trades (
-                            id INTEGER PRIMARY KEY, created TEXT NOT NULL, status TEXT NOT NULL,
-                            direction TEXT NOT NULL, entry TEXT NOT NULL, stop TEXT NOT NULL,
-                            target TEXT NOT NULL, minimum_target TEXT NOT NULL, quantity TEXT NOT NULL,
-                            budget TEXT NOT NULL, risk TEXT NOT NULL, reward TEXT NOT NULL,
-                            margin TEXT NOT NULL, entry_fee TEXT NOT NULL, stop_fee TEXT NOT NULL,
-                            target_fee TEXT NOT NULL, assumptions TEXT NOT NULL, notes TEXT NOT NULL,
-                            closed TEXT, pnl TEXT, funding TEXT
-                        )
-                    """.trimIndent())
-                    db.exec("""
-                        CREATE TABLE fills (
-                            id INTEGER PRIMARY KEY, trade_id INTEGER NOT NULL REFERENCES trades(id),
-                            time TEXT NOT NULL, kind TEXT NOT NULL, price TEXT NOT NULL,
-                            quantity TEXT NOT NULL, fee TEXT NOT NULL
-                        )
-                    """.trimIndent())
-                    db.exec("CREATE INDEX fills_trade ON fills(trade_id)")
-                    db.exec("CREATE TABLE transfers (id INTEGER PRIMARY KEY, time TEXT NOT NULL, amount TEXT NOT NULL)")
-                    db.exec("PRAGMA user_version=2")
-                }
-                2 -> Unit
-                else -> error("Unsupported Trading Journal database version.")
-            }
+        val bundledDriver = BundledSQLiteDriver()
+        val driver = object : SQLiteDriver {
+            override fun open(fileName: String) = bundledDriver.open(
+                fileName, SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or SQLITE_OPEN_URI
+            )
         }
-    }
-
-    private fun connect(mode: SQLiteConfig.TransactionMode = SQLiteConfig.TransactionMode.IMMEDIATE): Connection {
-        val config = SQLiteConfig().apply {
-            enforceForeignKeys(true)
-            setBusyTimeout(5000)
-            setTransactionMode(mode)
-        }
-        return DriverManager.getConnection("jdbc:sqlite:${path.toAbsolutePath()}", config.toProperties())
-    }
-
-    private fun <T> read(action: (Connection) -> T): T =
-        connect(SQLiteConfig.TransactionMode.DEFERRED).use { db ->
-            db.autoCommit = false
-            action(db)
-        }
-
-    private fun <T> write(action: (Connection) -> T): T = connect().use { db ->
-        db.autoCommit = false
+        database = Room.databaseBuilder<JournalDatabase>(path.toAbsolutePath().toString())
+            .setDriver(driver)
+            .addMigrations(migrateJournalToRoom)
+            .build()
         try {
-            action(db).also { db.commit() }
+            // Open eagerly so startup can report an incompatible database or a failed migration.
+            runBlocking { database.useReaderConnection { it.version() } }
         } catch (failure: Exception) {
-            try {
-                db.rollback()
-            } catch (rollback: Exception) {
-                failure.addSuppressed(rollback)
-            }
+            database.close()
             throw failure
         }
     }
 
-    fun settings(): Settings? = connect().use { settings(it) }
+    override fun close() = database.close()
 
-    fun saveSettings(settings: Settings) = write {
-        it.exec("INSERT OR REPLACE INTO settings VALUES (1, ?)", settings.encode())
+    private fun <T> read(action: suspend (Transactor) -> T): T = runBlocking {
+        database.useReaderConnection { db -> db.deferredTransaction { action(db) } }
+    }
+
+    private fun <T> write(action: suspend (Transactor) -> T): T = runBlocking {
+        database.useWriterConnection { db -> db.immediateTransaction { action(db) } }
+    }
+
+    fun settings(): Settings? = runBlocking { database.journalDao().settings()?.let(::decodeSettings) }
+
+    fun saveSettings(settings: Settings) = runBlocking {
+        database.journalDao().saveSettings(settings.encode())
     }
 
     fun savePlan(
@@ -102,12 +79,17 @@ class Journal(private val path: Path, private val clock: Clock = Clock.systemUTC
         """.trimIndent(), clock.instant(), Status.Planned, direction, entry, stop, plan.target,
             plan.minimumTarget, plan.quantity, plan.budget, plan.risk, plan.reward, plan.margin,
             plan.entryFee, plan.stopFee, plan.targetFee, settings.encode(), notes)
-        db.query("SELECT last_insert_rowid()") { getLong(1) }.single()
+        db.query("SELECT last_insert_rowid()") { getLong(0) }.single()
     }
 
     fun trades(): List<Trade> = read { trades(it) }
 
-    private fun trades(db: Connection, schema: String = "main", id: Long? = null): List<Trade> {
+    internal fun snapshot(): JournalSnapshot = read { db ->
+        val currentSettings = settings(db)
+        JournalSnapshot(currentSettings, trades(db), equity(db, currentSettings))
+    }
+
+    private suspend fun trades(db: Transactor, schema: String = "main", id: Long? = null): List<Trade> {
         val predicate = if (id == null) "" else " WHERE id=?"
         val args = listOfNotNull(id).toTypedArray()
         val fillPredicate = if (id == null) "" else " WHERE trade_id=?"
@@ -124,21 +106,21 @@ class Journal(private val path: Path, private val clock: Clock = Clock.systemUTC
                     amount("target_fee"), decodeSettings(getString("assumptions"))),
                 notes = getString("notes"),
                 fills = fills[tradeId].orEmpty(),
-                closed = getString("closed")?.let(Instant::parse),
-                pnl = getString("pnl")?.toBigDecimal(),
-                funding = getString("funding")?.toBigDecimal())
+                closed = nullableText("closed")?.let(Instant::parse),
+                pnl = nullableText("pnl")?.toBigDecimal(),
+                funding = nullableText("funding")?.toBigDecimal())
         }
     }
 
-    private fun trade(db: Connection, id: Long): Trade =
+    private suspend fun trade(db: Transactor, id: Long): Trade =
         requireNotNull(trades(db, id = id).singleOrNull()) { "Trade #$id does not exist." }
 
-    fun saveNotes(id: Long, notes: String) = write {
-        require(it.exec("UPDATE trades SET notes=? WHERE id=?", notes, id) == 1) { "Trade no longer exists." }
+    fun saveNotes(id: Long, notes: String) = runBlocking {
+        require(database.journalDao().saveNotes(id, notes) == 1) { "Trade no longer exists." }
     }
 
-    fun cancel(id: Long) = write {
-        require(it.exec("UPDATE trades SET status=? WHERE id=? AND status=?", Status.Cancelled, id, Status.Planned) == 1) {
+    fun cancel(id: Long) = runBlocking {
+        require(database.journalDao().cancel(id) == 1) {
             "Only planned trades can be cancelled."
         }
     }
@@ -175,15 +157,17 @@ class Journal(private val path: Path, private val clock: Clock = Clock.systemUTC
         Unit
     }
 
-    fun equity(): List<EquityPoint> = read { db ->
-        var equity = settings(db)?.get(Setting.Opening) ?: return@read emptyList()
+    fun equity(): List<EquityPoint> = read { db -> equity(db, settings(db)) }
+
+    private suspend fun equity(db: Transactor, settings: Settings?): List<EquityPoint> {
+        var equity = settings?.get(Setting.Opening) ?: return emptyList()
         var pnl = BigDecimal.ZERO
         val events = db.query("""
             SELECT time, amount, 0 AS trading, id FROM transfers
             UNION ALL SELECT closed, pnl, 1, id FROM trades WHERE status='Closed'
             ORDER BY trading, id
-        """.trimIndent()) { Triple(Instant.parse(getString(1)), amount("amount"), getBoolean("trading")) }
-        buildList {
+        """.trimIndent()) { Triple(Instant.parse(getText(0)), amount("amount"), getLong("trading") != 0L) }
+        return buildList {
             add(EquityPoint(null, equity, pnl))
             for ((time, amount, trading) in events.sortedBy { it.first }) {
                 equity += amount
@@ -195,14 +179,8 @@ class Journal(private val path: Path, private val clock: Clock = Clock.systemUTC
 
     fun backup(target: Path) {
         separate(target)
-        val absolute = target.toAbsolutePath()
-        val temp = Files.createTempFile(absolute.parent, ".journal-backup-", ".sqlite3")
-        try {
-            connect().use { it.exec("VACUUM INTO ?", temp.toString()) }
-            Files.move(temp, absolute, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-        } finally {
-            Files.deleteIfExists(temp)
+        writeAtomically(target) { temp ->
+            runBlocking { database.useWriterConnection { it.exec("VACUUM INTO ?", temp.toString()) } }
         }
     }
 
@@ -212,120 +190,127 @@ class Journal(private val path: Path, private val clock: Clock = Clock.systemUTC
     private fun withBackup(source: Path, replace: Boolean) {
         separate(source)
         require(Files.isRegularFile(source)) { "Choose an existing Trading Journal backup." }
-        // ATTACH keeps validation and the replacement in one transaction.
-        write { db ->
-            db.exec("ATTACH DATABASE ? AS backup", source.toAbsolutePath().toUri().toASCIIString() + "?mode=ro")
-            require(db.version("backup") == 2 &&
-                db.query("PRAGMA backup.integrity_check") { getString(1) } == listOf("ok") &&
-                db.query("PRAGMA backup.foreign_key_check") { getString(1) }.isEmpty()) {
-                "Choose a valid Trading Journal backup."
-            }
-            val actualTables = db.query("SELECT name FROM backup.sqlite_master WHERE type='table'") { getString(1) }
-            require(actualTables.toSet() == tables.keys) { "The backup has an unexpected database schema." }
-            for ((table, columns) in tables) {
-                val actual = db.query("PRAGMA backup.table_info($table)") { getString("name") }
-                require(actual == columns.split(',')) { "The backup has an unexpected $table schema." }
-            }
-            settings(db, "backup")
-            for (trade in trades(db, "backup")) {
-                val plan = trade.plan
-                check(plan == calculate(plan.assumptions, plan.direction, plan.entry, plan.stop, plan.target)) {
-                    "Backup contains an inconsistent plan for trade #${trade.id}."
-                }
-                var open = BigDecimal.ZERO
-                var previous: Instant? = null
-                for (fill in trade.fills) {
-                    check(previous?.let { fill.time >= it } != false) { "Backup fills are out of order." }
-                    open += if (fill.kind == FillKind.Entry) fill.quantity else -fill.quantity
-                    check(open.signum() >= 0) { "Backup contains an exit that exceeds the open quantity." }
-                    previous = fill.time
-                }
-                when (trade.status) {
-                    Status.Closed -> check(trade.funding != null && trade.closed == trade.fills.lastOrNull()?.time &&
-                        trade.pnl?.compareTo(trade.netPnl(trade.funding)) == 0) {
-                        "Backup contains an inconsistent closed trade."
+        runBlocking {
+            database.useWriterConnection { db ->
+                db.exec("ATTACH DATABASE ? AS backup", source.toAbsolutePath().toUri().toASCIIString() + "?mode=ro")
+                try {
+                    // Validate the same snapshot that will be copied. Room keeps its own schema metadata.
+                    db.withTransaction(if (replace) Transactor.SQLiteTransactionType.IMMEDIATE
+                        else Transactor.SQLiteTransactionType.DEFERRED) {
+                        checkBackup(db)
+                        if (replace) {
+                            for (table in journalColumns.keys.reversed()) db.exec("DELETE FROM main.$table")
+                            for ((table, columns) in journalColumns)
+                                db.exec("INSERT INTO main.$table ($columns) SELECT $columns FROM backup.$table")
+                        }
                     }
-                    else -> check(trade.closed == null && trade.pnl == null && trade.funding == null &&
-                        (trade.fills.isNotEmpty() == (trade.status == Status.Open))) {
-                        "Backup contains an inconsistent active or cancelled trade."
-                    }
+                } finally {
+                    db.exec("DETACH DATABASE backup")
                 }
             }
-            db.query("SELECT time, amount FROM backup.transfers") {
-                Instant.parse(getString(1))
-                check(amount("amount").signum() != 0) { "Backup contains a zero transfer." }
-            }
-            if (replace) {
-                for (table in tables.keys.reversed()) db.exec("DELETE FROM main.$table")
-                for ((table, columns) in tables)
-                    db.exec("INSERT INTO main.$table ($columns) SELECT $columns FROM backup.$table")
-            }
+        }
+    }
+
+    private suspend fun checkBackup(db: Transactor) {
+        val version = db.version("backup")
+        require(version in setOf(LEGACY_JOURNAL_VERSION, JOURNAL_VERSION) &&
+            db.query("PRAGMA backup.integrity_check") { getText(0) } == listOf("ok") &&
+            db.query("PRAGMA backup.foreign_key_check") { getText(0) }.isEmpty()) {
+            "Choose a valid Trading Journal backup."
+        }
+        val actualTables = db.query("SELECT name FROM backup.sqlite_master WHERE type='table'") { getText(0) }.toSet()
+        val expected = if (version == JOURNAL_VERSION) journalColumns.keys + "room_master_table" else journalColumns.keys
+        require(actualTables == expected) { "The backup has an unexpected database schema." }
+        for ((table, columns) in journalColumns) {
+            val actual = db.query("PRAGMA backup.table_info($table)") { getString("name") }
+            require(actual == columns.split(',')) { "The backup has an unexpected $table schema." }
+        }
+        settings(db, "backup")
+        for (trade in trades(db, "backup")) {
+            trade.validateStoredRecord()
+        }
+        db.query("SELECT time, amount FROM backup.transfers") {
+            Instant.parse(getText(0))
+            check(amount("amount").signum() != 0) { "Backup contains a zero transfer." }
         }
     }
 
     fun export(target: Path) {
         separate(target)
-        Files.newBufferedWriter(target).use { writer ->
-            fun row(vararg values: Any?) {
-                writer.appendLine(values.joinToString(",") {
-                    val escaped = it?.toString().orEmpty().replace("\"", "\"\"")
-                    "\"$escaped\""
-                })
-            }
-            writer.write("\uFEFF")
-            row("ID", "Created UTC", "Status", "Exchange", "Market", "Timeframe", "Direction", "Sizing equity USDT",
-                "Entry", "Stop", "Target", "Minimum target", "BTC", "Budget USDT", "Estimated risk USDT",
-                "Estimated reward USDT", "Estimated margin USDT", "Reward per unit risk", "Closed UTC",
-                "Net P&L USDT", "Funding USDT", "Realized R", "Notes", "Deviations", "Fills (UTC/type/price/BTC/fee)")
-            for (trade in trades()) {
-                val p = trade.plan
-                val notes = if (trade.notes.trimStart().firstOrNull() in listOf('=', '+', '-', '@'))
-                    "'${trade.notes}" else trade.notes
-                row(trade.id, trade.created, trade.status, "Bitget", "BTCUSDT USDT-M", "5m", p.direction,
-                    p.assumptions[Setting.Equity].display(), p.entry.display(), p.stop.display(),
-                    p.target.display(), p.minimumTarget.display(), p.quantity.display(), p.budget.display(),
-                    p.risk.display(), p.reward.display(), p.margin.display(), p.rewardMultiple.display(),
-                    trade.closed, trade.pnl?.display(), trade.funding?.display(), trade.realizedR?.display(),
-                    notes, trade.deviations().joinToString("\n"), trade.fills.joinToString("\n") {
-                        "${it.time} / ${it.kind} / ${it.price.display()} / ${it.quantity.display()} / ${it.fee.display()}"
-                    })
-            }
-        }
+        val records = trades()
+        writeAtomically(target) { writeTradeCsv(it, records) }
     }
 
     private fun separate(file: Path) {
-        require(file.toAbsolutePath().normalize() != path.toAbsolutePath().normalize() &&
-            !(Files.exists(file) && Files.isSameFile(file, path))) {
-            "Choose a path other than the live journal database."
+        val target = file.toAbsolutePath().normalize()
+        val live = path.toRealPath()
+        val parent = target.parent?.takeIf(Files::exists)?.toRealPath()
+        val resolved = parent?.resolve(target.fileName) ?: target
+        val protectedFiles = listOf("", "-wal", "-shm", "-journal").map { suffix ->
+            live.resolveSibling("${live.fileName}$suffix")
         }
+        require(protectedFiles.none { protected ->
+            resolved == protected ||
+                (Files.exists(target) && Files.exists(protected) && Files.isSameFile(target, protected))
+        }) { "Choose a path outside the live journal database files." }
     }
 }
 
-private fun Settings.encode(): String = Setting.entries.joinToString("|") { get(it).toString() }
+private fun writeAtomically(target: Path, write: (Path) -> Unit) {
+    val absolute = target.toAbsolutePath()
+    val temp = Files.createTempFile(absolute.parent, ".journal-", ".tmp")
+    try {
+        write(temp)
+        Files.move(temp, absolute, ATOMIC_MOVE, REPLACE_EXISTING)
+    } finally {
+        Files.deleteIfExists(temp)
+    }
+}
+
+// This is the on-disk order used by schema versions 2 and 3, independent of the UI order.
+private val storedSettingsOrder = listOf(
+    Setting.Opening, Setting.Equity, Setting.Available, Setting.Leverage,
+    Setting.EntryFee, Setting.ExitFee, Setting.Slippage, Setting.Step,
+    Setting.Minimum, Setting.Notional, Setting.Tick
+)
+
+private fun Settings.encode(): String = storedSettingsOrder.joinToString("|") { get(it).toString() }
 
 private fun decodeSettings(raw: String): Settings {
     val values = raw.split('|')
-    require(values.size == Setting.entries.size) { "Invalid saved settings." }
-    return Settings(Setting.entries.associateWith { values[it.ordinal].toBigDecimal() })
+    require(values.size == storedSettingsOrder.size) { "Invalid saved settings." }
+    return Settings(storedSettingsOrder.zip(values.map(String::toBigDecimal)).toMap())
 }
 
-private fun settings(db: Connection, schema: String = "main"): Settings? =
-    db.query("SELECT data FROM $schema.settings WHERE id=1") { decodeSettings(getString(1)) }.singleOrNull()
+private suspend fun settings(db: Transactor, schema: String = "main"): Settings? =
+    db.query("SELECT data FROM $schema.settings WHERE id=1") { decodeSettings(getText(0)) }.singleOrNull()
 
-private fun Connection.version(schema: String = "main"): Int =
-    query("PRAGMA $schema.user_version") { getInt(1) }.single()
+private suspend fun Transactor.version(schema: String = "main"): Int =
+    query("PRAGMA $schema.user_version") { getLong(0).toInt() }.single()
 
-private fun ResultSet.amount(name: String): BigDecimal = getString(name).toBigDecimal()
+private fun SQLiteStatement.amount(name: String): BigDecimal = getString(name).toBigDecimal()
+private fun SQLiteStatement.getString(name: String): String = getText(column(name))
+private fun SQLiteStatement.getLong(name: String): Long = getLong(column(name))
 
-private fun Connection.exec(sql: String, vararg arguments: Any): Int =
-    prepareStatement(sql).use { statement ->
-        arguments.forEachIndexed { index, value -> statement.setString(index + 1, value.toString()) }
-        statement.executeUpdate()
+private fun SQLiteStatement.nullableText(name: String): String? {
+    val index = column(name)
+    return if (isNull(index)) null else getText(index)
+}
+
+private fun SQLiteStatement.column(name: String): Int =
+    (0 until getColumnCount()).first { getColumnName(it) == name }
+
+private suspend fun Transactor.exec(sql: String, vararg arguments: Any) {
+    usePrepared(sql) { statement ->
+        arguments.forEachIndexed { index, value -> statement.bindText(index + 1, value.toString()) }
+        statement.step()
     }
+}
 
-private fun <T> Connection.query(sql: String, vararg arguments: Any, read: ResultSet.() -> T): List<T> =
-    prepareStatement(sql).use { statement ->
-        arguments.forEachIndexed { index, value -> statement.setString(index + 1, value.toString()) }
-        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.read()) } }
+private suspend fun <T> Transactor.query(
+    sql: String, vararg arguments: Any, read: SQLiteStatement.() -> T
+): List<T> = usePrepared(sql) { statement ->
+    arguments.forEachIndexed { index, value -> statement.bindText(index + 1, value.toString()) }
+    buildList { while (statement.step()) add(statement.read()) }
     }
 
